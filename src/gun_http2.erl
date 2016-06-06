@@ -32,7 +32,10 @@
 	%% Whether we finished sending data.
 	local = nofin :: cowboy_stream:fin(),
 	%% Whether we finished receiving data.
-	remote = nofin :: cowboy_stream:fin()
+	remote = nofin :: cowboy_stream:fin(),
+	%% One header block, ignore any further header blocks, then if we receive some data,
+	%% there can be a trailing header block
+	header_state = awaiting_headers :: awaiting_headers | received_headers | maybe_awaiting_trailers
 }).
 
 -record(http2_state, {
@@ -93,7 +96,9 @@ frame({data, StreamID, IsFin, Data}, State=#http2_state{owner=Owner}) ->
 	case get_stream_by_id(StreamID, State) of
 		Stream = #stream{ref=StreamRef, remote=nofin} ->
 			Owner ! {gun_data, self(), StreamRef, IsFin, Data},
-			remote_fin(Stream, State, IsFin);
+			NewStream = Stream#stream{header_state=maybe_awaiting_trailers},
+			NewState = replace_stream(NewStream, State),
+			remote_fin(NewStream, NewState, IsFin);
 		_ ->
 			%% @todo protocol_error if not existing
 			stream_reset(State, StreamID, {stream_error, stream_closed,
@@ -103,16 +108,33 @@ frame({data, StreamID, IsFin, Data}, State=#http2_state{owner=Owner}) ->
 frame({headers, StreamID, IsFin, head_fin, HeaderBlock},
 		State=#http2_state{owner=Owner, decode_state=DecodeState0}) ->
 	case get_stream_by_id(StreamID, State) of
-		Stream = #stream{ref=StreamRef, remote=nofin} ->
+		Stream = #stream{ref=StreamRef, remote=nofin, header_state=HeadersState} ->
 			try cow_hpack:decode(HeaderBlock, DecodeState0) of
 				{Headers0, DecodeState} ->
-					case lists:keytake(<<":status">>, 1, Headers0) of
-						{value, {_, Status}, Headers} ->
-							Owner ! {gun_response, self(), StreamRef, IsFin, parse_status(Status), Headers},
+					case HeadersState of
+						awaiting_headers ->
+							case lists:keytake(<<":status">>, 1, Headers0) of
+								{value, {_, Status}, Headers} ->
+									Owner ! {gun_response, self(), StreamRef, IsFin, parse_status(Status), Headers},
+									NewStream = Stream#stream{
+												  header_state = received_headers
+												 },
+									NewState = replace_stream(NewStream, State),
+									remote_fin(NewStream, NewState#http2_state{decode_state=DecodeState}, IsFin);
+								false ->
+									stream_reset(State, StreamID, {stream_error, protocol_error,
+																   'Test. Malformed response; missing :status in HEADERS frame. (RFC7540 8.1.2.4)'})
+							end;
+						received_headers ->
 							remote_fin(Stream, State#http2_state{decode_state=DecodeState}, IsFin);
-						false ->
-							stream_reset(State, StreamID, {stream_error, protocol_error,
-								'Malformed response; missing :status in HEADERS frame. (RFC7540 8.1.2.4)'})
+						maybe_awaiting_trailers ->
+							case IsFin of
+								nofin ->
+									ok;
+								fin ->
+									Owner ! {gun_data, self(), StreamRef, IsFin, <<>>}
+							end,
+							remote_fin(Stream, State#http2_state{decode_state=DecodeState}, IsFin)
 					end
 			catch _:_ ->
 				terminate(State, {connection_error, compression_error,
@@ -316,6 +338,10 @@ get_stream_by_ref(StreamRef, #http2_state{streams=Streams}) ->
 
 delete_stream(StreamID, State=#http2_state{streams=Streams}) ->
 	Streams2 = lists:keydelete(StreamID, #stream.id, Streams),
+	State#http2_state{streams=Streams2}.
+
+replace_stream(S, State=#http2_state{streams=Streams}) ->
+	Streams2 = lists:keyreplace(S#stream.id, #stream.id, Streams, S),
 	State#http2_state{streams=Streams2}.
 
 remote_fin(_, State, nofin) ->
